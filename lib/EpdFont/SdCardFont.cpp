@@ -43,14 +43,17 @@ inline uint16_t readU16(const uint8_t* p) { return p[0] | (p[1] << 8); }
 inline int16_t readI16(const uint8_t* p) { return static_cast<int16_t>(p[0] | (p[1] << 8)); }
 inline uint32_t readU32(const uint8_t* p) { return p[0] | (p[1] << 8) | (p[2] << 16) | (p[3] << 24); }
 
-// Walks a null-terminated UTF-8 string and appends each unique codepoint to
-// codepoints[0..cpCount-1] via O(n²) dedup.  Returns true if the buffer
-// reached maxCount (cap hit), false if all codepoints fit.
-bool collectUniqueCodepoints(const char* text, uint32_t* codepoints, uint32_t& cpCount, uint32_t maxCount) {
+// Walks a null-terminated UTF-8 string and appends each unique codepoint that
+// `wanted` accepts to codepoints[0..cpCount-1] via O(n²) dedup.  Returns true
+// if the buffer reached maxCount (cap hit), false if all codepoints fit.
+template <typename Wanted>
+bool collectUniqueCodepoints(const char* text, uint32_t* codepoints, uint32_t& cpCount, uint32_t maxCount,
+                             Wanted wanted) {
   const unsigned char* p = reinterpret_cast<const unsigned char*>(text);
   while (*p) {
     uint32_t cp = utf8NextCodepoint(&p);
     if (cp == 0) break;
+    if (!wanted(cp)) continue;
     bool found = false;
     for (uint32_t i = 0; i < cpCount; i++) {
       if (codepoints[i] == cp) {
@@ -212,11 +215,13 @@ void SdCardFont::freeAll() {
 }
 
 void SdCardFont::clearOverflow() {
-  for (uint32_t i = 0; i < overflowCount_; i++) {
-    delete[] overflow_[i].bitmap;
-    overflow_[i].bitmap = nullptr;
-    overflow_[i].codepoint = 0;
-  }
+  // Live entries form a ring starting at overflowOldest_, so after budget
+  // evictions they are not confined to slots [0, overflowCount_). Free every
+  // slot (evicted slots hold nullptr) to avoid leaking the ring's tail.
+  for (uint32_t i = 0; i < overflowCapacity_; i++) delete[] overflow_[i].bitmap;
+  delete[] overflow_;
+  overflow_ = nullptr;
+  overflowCapacity_ = 0;
   overflowCount_ = 0;
   overflowNext_ = 0;
   overflowOldest_ = 0;
@@ -835,6 +840,22 @@ uint32_t SdCardFont::overflowBitmapBudget() const {
   if (freeHeap <= OVERFLOW_LOW_HEAP_RESERVE_BYTES) return 0;
   return std::min<uint32_t>(OVERFLOW_BITMAP_BUDGET_BYTES,
                             static_cast<uint32_t>(freeHeap - OVERFLOW_LOW_HEAP_RESERVE_BYTES));
+}
+
+bool SdCardFont::ensureOverflowTable() {
+  if (overflow_) return true;
+  // The ring counters are already zero: clearOverflow() resets them whenever it
+  // releases the table. A smaller table only thrashes sooner, so prefer it over
+  // failing the glyph.
+  for (const uint32_t capacity : OVERFLOW_TABLE_CAPACITIES) {
+    overflow_ = new (std::nothrow) OverflowEntry[capacity]();
+    if (!overflow_) continue;
+    overflowCapacity_ = capacity;
+    if (capacity != OVERFLOW_CAPACITY) LOG_INF("SDCF", "Overflow: low heap, using %u-slot table", capacity);
+    return true;
+  }
+  LOG_ERR("SDCF", "Overflow: failed to allocate slot table");
+  return false;
 }
 
 int32_t SdCardFont::findGlobalGlyphIndex(const PerStyle& s, uint32_t codepoint) const {
@@ -1621,21 +1642,41 @@ int SdCardFont::buildAdvanceTableRange(Iter begin, Iter end, bool includeSpace, 
 
   unsigned long startMs = millis();
 
+  // The advance table is bounded, so only codepoints that can still enter it
+  // are worth collecting. Layout resets and refills it for every paragraph,
+  // so size the scan buffer to the table's room (~3KB) rather than a fixed
+  // 4096-entry worst case (16KB) that a fragmented heap often cannot supply.
+  uint32_t room = 0;
+  for (uint8_t si = 0; si < MAX_STYLES; si++) {
+    if (!(styleMask & (1u << si)) || !styles_[si].present) continue;
+    if (advanceTableSize_[si] < ADVANCE_CACHE_LIMIT) room = std::max(room, ADVANCE_CACHE_LIMIT - advanceTableSize_[si]);
+  }
+  if (room == 0) return 0;
+
+  const auto uncached = [this, styleMask](const uint32_t cp) {
+    for (uint8_t si = 0; si < MAX_STYLES; si++) {
+      if ((styleMask & (1u << si)) && styles_[si].present && advanceTableSize_[si] < ADVANCE_CACHE_LIMIT &&
+          !advanceTableLookup(si, cp, nullptr)) {
+        return true;
+      }
+    }
+    return false;
+  };
+
   // +2 reserved slots for space and hyphen injected after the main scan.
-  static constexpr uint32_t MAX_UNIQUE_CODEPOINTS = 4096;
-  uint32_t* codepoints = new (std::nothrow) uint32_t[MAX_UNIQUE_CODEPOINTS + 2];
+  uint32_t* codepoints = new (std::nothrow) uint32_t[room + 2];
   if (!codepoints) {
-    LOG_ERR("SDCF", "buildAdvanceTable: failed to allocate codepoint buffer (%u bytes)", MAX_UNIQUE_CODEPOINTS * 4);
+    LOG_ERR("SDCF", "buildAdvanceTable: failed to allocate codepoint buffer (%u bytes)", (room + 2) * 4);
     return -1;
   }
   uint32_t cpCount = 0;
   bool hitCap = false;
 
   for (auto it = begin; it != end && !hitCap; ++it) {
-    hitCap = collectUniqueCodepoints(asCStr(*it), codepoints, cpCount, MAX_UNIQUE_CODEPOINTS);
+    hitCap = collectUniqueCodepoints(asCStr(*it), codepoints, cpCount, room, uncached);
   }
   if (extraText && !hitCap) {
-    hitCap = collectUniqueCodepoints(extraText, codepoints, cpCount, MAX_UNIQUE_CODEPOINTS);
+    hitCap = collectUniqueCodepoints(extraText, codepoints, cpCount, room, uncached);
   }
 
   if (includeSpace && std::none_of(codepoints, codepoints + cpCount, [](uint32_t c) { return c == ' '; }))
@@ -1643,10 +1684,9 @@ int SdCardFont::buildAdvanceTableRange(Iter begin, Iter end, bool includeSpace, 
   if (includeHyphen && std::none_of(codepoints, codepoints + cpCount, [](uint32_t c) { return c == '-'; }))
     codepoints[cpCount++] = '-';
 
-  if (hitCap) {
-    LOG_ERR("SDCF", "buildAdvanceTable: unique codepoint cap (%u) hit, layout may be approximate",
-            MAX_UNIQUE_CODEPOINTS);
-  }
+  // Codepoints beyond the table's room are measured through glyph metrics,
+  // which yields the same advances, so a full table only costs speed.
+  if (hitCap) LOG_DBG("SDCF", "buildAdvanceTable: collected %u codepoints to fill the advance table", room);
   std::sort(codepoints, codepoints + cpCount);
   int totalMissed = fetchAdvancesForCodepoints(codepoints, cpCount, styleMask);
   delete[] codepoints;
@@ -1738,9 +1778,10 @@ const EpdGlyph* SdCardFont::onGlyphMiss(void* ctx, uint32_t codepoint) {
   // Without this, scrolling a page whose working set approaches or exceeds
   // capacity (the font-catalog family list, ~300 distinct CJK names) evicts
   // nearly every glyph between frames and reloads them from SD one at a time.
-  for (uint32_t i = 0; i < self->overflowCount_; i++) {
+  for (uint32_t k = 0; k < self->overflowCount_; k++) {
+    const uint32_t i = (self->overflowOldest_ + k) % self->overflowCapacity_;
     if (self->overflow_[i].codepoint == codepoint && self->overflow_[i].styleIdx == styleIdx) {
-      const uint32_t newest = (self->overflowOldest_ + self->overflowCount_ - 1) % OVERFLOW_CAPACITY;
+      const uint32_t newest = (self->overflowOldest_ + self->overflowCount_ - 1) % self->overflowCapacity_;
       if (i != newest) {
         OverflowEntry tmp = self->overflow_[i];
         self->overflow_[i] = self->overflow_[newest];
@@ -1753,13 +1794,14 @@ const EpdGlyph* SdCardFont::onGlyphMiss(void* ctx, uint32_t codepoint) {
   // Look up global glyph index via full intervals
   int32_t globalIdx = self->findGlobalGlyphIndex(s, codepoint);
   if (globalIdx < 0) return nullptr;
+  if (!self->ensureOverflowTable()) return nullptr;
 
   // Pick an overflow slot. Prefer an unused slot, but evict oldest entries
   // until both the slot count and aggregate bitmap-byte budget can admit the
   // new glyph. Reads happen into temporaries so failed I/O leaves the cache
   // unchanged.
   uint32_t slot = self->overflowNext_;
-  bool wasAtCapacity = (self->overflowCount_ == OVERFLOW_CAPACITY);
+  bool wasAtCapacity = (self->overflowCount_ == self->overflowCapacity_);
   // Reuse metadata already fetched during width measurement. On a cache miss,
   // retain the existing metadata read before loading the bitmap.
   HalFile localFile;
@@ -1811,21 +1853,21 @@ const EpdGlyph* SdCardFont::onGlyphMiss(void* ctx, uint32_t codepoint) {
     self->overflowBitmapBytes_ -= self->overflow_[evictSlot].glyph.dataLength;
     delete[] self->overflow_[evictSlot].bitmap;
     self->overflow_[evictSlot] = OverflowEntry{};
-    self->overflowOldest_ = (evictSlot + 1) % OVERFLOW_CAPACITY;
+    self->overflowOldest_ = (evictSlot + 1) % self->overflowCapacity_;
     self->overflowCount_--;
     wasAtCapacity = false;
   }
 
   slot = self->overflowNext_;
-  wasAtCapacity = (self->overflowCount_ == OVERFLOW_CAPACITY);
+  wasAtCapacity = (self->overflowCount_ == self->overflowCapacity_);
   if (wasAtCapacity) {
     self->overflowBitmapBytes_ -= self->overflow_[slot].glyph.dataLength;
     delete[] self->overflow_[slot].bitmap;
-    self->overflowOldest_ = (self->overflowOldest_ + 1) % OVERFLOW_CAPACITY;
+    self->overflowOldest_ = (self->overflowOldest_ + 1) % self->overflowCapacity_;
   } else {
     self->overflowCount_++;
   }
-  self->overflowNext_ = (slot + 1) % OVERFLOW_CAPACITY;
+  self->overflowNext_ = (slot + 1) % self->overflowCapacity_;
   self->overflow_[slot].glyph = tempGlyph;
   self->overflow_[slot].bitmap = tempBitmap;
   self->overflowBitmapBytes_ += tempGlyph.dataLength;
@@ -1833,20 +1875,20 @@ const EpdGlyph* SdCardFont::onGlyphMiss(void* ctx, uint32_t codepoint) {
   self->overflow_[slot].styleIdx = styleIdx;
 
   LOG_DBG("SDCF", "Overflow: loaded U+%04X style %u on demand (slot %u/%u)", codepoint, styleIdx, slot,
-          OVERFLOW_CAPACITY);
+          self->overflowCapacity_);
 
   return &self->overflow_[slot].glyph;
 }
 
 bool SdCardFont::isOverflowGlyph(const EpdGlyph* glyph) const {
-  for (uint32_t i = 0; i < OVERFLOW_CAPACITY; i++) {
+  for (uint32_t i = 0; i < overflowCapacity_; i++) {
     if (&overflow_[i].glyph == glyph) return true;
   }
   return false;
 }
 
 const uint8_t* SdCardFont::getOverflowBitmap(const EpdGlyph* glyph) const {
-  for (uint32_t i = 0; i < OVERFLOW_CAPACITY; i++) {
+  for (uint32_t i = 0; i < overflowCapacity_; i++) {
     if (&overflow_[i].glyph == glyph) {
       return overflow_[i].bitmap;
     }

@@ -274,17 +274,26 @@ class SdCardFont {
   // each measure/draw traversal. Keep enough slots for a normal page while also
   // enforcing a bitmap-byte budget so unusual large glyphs cannot consume the
   // TLS/reader heap reserve.
+  //
+  // The slot table is allocated on the first miss and released by
+  // clearOverflow(), which every render scope runs on every SD font. A reader
+  // font whose prewarm succeeds, and UI sizes the current screen doesn't use,
+  // therefore hold no table between pages. The smaller table capacities let a
+  // miss still be served when the heap can't spare the full table.
   static constexpr uint32_t OVERFLOW_CAPACITY = 120;
+  static constexpr uint32_t OVERFLOW_TABLE_CAPACITIES[] = {OVERFLOW_CAPACITY, 32, 8};
   static constexpr uint32_t OVERFLOW_BITMAP_BUDGET_BYTES = 24 * 1024;
   static constexpr uint32_t OVERFLOW_LOW_HEAP_RESERVE_BYTES = 8 * 1024;
   uint32_t overflowBitmapBudget() const;
+  bool ensureOverflowTable();
   struct OverflowEntry {
     EpdGlyph glyph;
     uint8_t* bitmap = nullptr;
     uint32_t codepoint = 0;
     uint8_t styleIdx = 0;
   };
-  OverflowEntry overflow_[OVERFLOW_CAPACITY] = {};
+  OverflowEntry* overflow_ = nullptr;
+  uint32_t overflowCapacity_ = 0;
   uint32_t overflowCount_ = 0;
   uint32_t overflowNext_ = 0;
   uint32_t overflowOldest_ = 0;
