@@ -253,12 +253,8 @@ const uint8_t* GfxRenderer::getGlyphBitmap(const EpdFontData* fontData, const Ep
     // must consume it (draw the glyph) before requesting another bitmap.
     return fd->getBitmap(fontData, glyph, glyphIndex);
   }
-  if (fontData->glyphMissCtx) {
-    auto* sdFont = SdCardFont::fromMissCtx(fontData->glyphMissCtx);
-    if (sdFont->isOverflowGlyph(glyph)) {
-      return sdFont->getOverflowBitmap(glyph);
-    }
-  }
+  // SD card font page bitmaps may be chunked, so let the font resolve them.
+  if (fontData->glyphMissCtx) return SdCardFont::glyphBitmap(fontData->glyphMissCtx, glyph);
   return &fontData->bitmap[glyph->dataOffset];
 }
 

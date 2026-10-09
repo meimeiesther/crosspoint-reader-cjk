@@ -109,8 +109,13 @@ class SdCardFont {
   const uint8_t* getOverflowBitmap(const EpdGlyph* glyph) const;
 
   // Extract SdCardFont* from an opaque glyphMissCtx pointer.
-  // Used by GfxRenderer::getGlyphBitmap() to recover the SdCardFont from EpdFontData::glyphMissCtx.
   static SdCardFont* fromMissCtx(void* ctx);
+
+  // Bitmap for a glyph of the EpdFontData whose glyphMissCtx is `ctx`: an
+  // overflow glyph, or a prewarmed glyph in the page arena or page chunks.
+  // Returns nullptr when the glyph has no resident bitmap.
+  // Used by GfxRenderer::getGlyphBitmap() for every SD card font glyph.
+  static const uint8_t* glyphBitmap(const void* ctx, const EpdGlyph* glyph);
 
   struct Stats {
     uint32_t prewarmTotalMs = 0;
@@ -213,7 +218,17 @@ class SdCardFont {
     EpdFontData miniData{};
     EpdUnicodeInterval* miniIntervals = nullptr;
     EpdGlyph* miniGlyphs = nullptr;
+    // Contiguous page bitmap inside the coverage arena (non-owning), used only
+    // when miniBitmapUsesCoverageArena. Otherwise page bitmaps live in
+    // miniChunks: a dense CJK page needs 30KB+, which a fragmented heap rarely
+    // has in one piece, while MINI_CHUNK_BYTES pieces almost always fit. A
+    // glyph's dataOffset is then a linear address with stride miniChunkBytes,
+    // resolved by glyphBitmap().
     uint8_t* miniBitmap = nullptr;
+    uint8_t** miniChunks = nullptr;
+    uint16_t miniChunkCount = 0;  // allocated chunks, kept across pages
+    uint16_t miniChunkSlots = 0;  // miniChunks pointer-array capacity
+    uint32_t miniChunkBytes = 0;
     uint32_t miniIntervalCount = 0;
     uint32_t miniGlyphCount = 0;
     uint32_t miniIntervalCapacity = 0;
@@ -346,6 +361,12 @@ class SdCardFont {
   void freeStyleAll(PerStyle& s);
   void freeStyleKernLigatureData(PerStyle& s);
   void freeStyleMiniKern(PerStyle& s);
+  // Page bitmap chunks: sized so any glyph fits one chunk, kept across pages
+  // like the other mini buffers. ensureMiniChunks() keeps chunks of the same
+  // size and allocates only the missing ones.
+  static constexpr uint32_t MINI_CHUNK_BYTES = 4096;
+  static void freeMiniChunks(PerStyle& s);
+  static bool ensureMiniChunks(PerStyle& s, uint32_t chunkBytes, uint32_t count);
   bool loadStyleKernLigatureData(PerStyle& s);
   bool buildMiniKernMatrix(PerStyle& s, const uint32_t* codepoints, uint32_t cpCount);
   void applyKernLigaturePointers(PerStyle& s, EpdFontData& data) const;

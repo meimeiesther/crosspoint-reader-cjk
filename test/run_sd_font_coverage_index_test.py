@@ -30,7 +30,7 @@ require(SOURCE, "if (s.intervalsAreBmpCoverage)")
 require(SOURCE, "totalBitmapSize <= s.bmpMiniBitmapCapacity")
 require(SOURCE, "s.miniBitmapUsesCoverageArena = true")
 require(SOURCE, "if (s.intervalsAreBmpCoverage && totalBitmapSize <= s.bmpMiniBitmapCapacity)")
-require(SOURCE, "ensureArrayCapacity(s.miniBitmap, s.miniBitmapCapacity, totalBitmapSize)")
+require(SOURCE, "ensureMiniChunks(s, chunkBytes, chunkCount)")
 require(SOURCE, "const uint32_t precedingMask = targetMask - 1u")
 require(SOURCE, "delete[] s.bmpCoverageData")
 
