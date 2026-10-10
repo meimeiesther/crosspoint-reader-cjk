@@ -301,6 +301,7 @@ class SdCardFont {
   static constexpr uint32_t OVERFLOW_LOW_HEAP_RESERVE_BYTES = 8 * 1024;
   uint32_t overflowBitmapBudget() const;
   bool ensureOverflowTable();
+  int32_t overflowSlotOf(const EpdGlyph* glyph) const;  // -1 if not an overflow glyph
   struct OverflowEntry {
     EpdGlyph glyph;
     uint8_t* bitmap = nullptr;
@@ -366,6 +367,7 @@ class SdCardFont {
   // size and allocates only the missing ones.
   static constexpr uint32_t MINI_CHUNK_BYTES = 4096;
   static void freeMiniChunks(PerStyle& s);
+  static void trimMiniChunks(PerStyle& s, uint32_t keep);  // frees chunks [keep, count)
   static bool ensureMiniChunks(PerStyle& s, uint32_t chunkBytes, uint32_t count);
   bool loadStyleKernLigatureData(PerStyle& s);
   bool buildMiniKernMatrix(PerStyle& s, const uint32_t* codepoints, uint32_t cpCount);

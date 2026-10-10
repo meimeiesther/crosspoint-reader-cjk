@@ -41,7 +41,7 @@ if prewarm.count("ChunkedBitmapLayout::place(") < 2:
 
 lookup = body(source, "const uint8_t* SdCardFont::glyphBitmap")
 for needle, message in (
-    ("isOverflowGlyph(glyph)", "glyphBitmap ignores overflow glyphs"),
+    ("overflowSlotOf(glyph)", "glyphBitmap ignores overflow glyphs"),
     ("s.miniMetadataOnly", "glyphBitmap resolves file offsets of a metadata-only build"),
     (">= s.miniChunkCount", "glyphBitmap does not bound the chunk index"),
     ("ChunkedBitmapLayout::resolve(", "glyphBitmap does not use the shared chunk addressing"),
@@ -60,6 +60,17 @@ if "std::copy(s.miniChunks" not in ensure:
     failures.append("growing the chunk pointer array drops existing chunks")
 if "if (s.miniChunkBytes != chunkBytes) freeMiniChunks(s);" not in ensure:
     failures.append("chunks of a different size are reused")
+
+# Underuse hysteresis: chunked pages round up to whole chunks, so judge them in
+# chunks and trim the surplus rather than dropping the resident page.
+reset = body(source, "void SdCardFont::resetStyleMiniData")
+if "ChunkedBitmapLayout::chunkCount(s.miniBitmapUsed, s.miniChunkBytes)" not in reset:
+    failures.append("underuse hysteresis compares bytes against whole-chunk capacity")
+if "trimMiniChunks(s, neededChunks);" not in reset or reset.count("freeStyleMiniData(s);") != 1:
+    failures.append("underuse drops the resident page instead of trimming surplus chunks")
+trim = body(source, "void SdCardFont::trimMiniChunks")
+if "delete[] s.miniChunks[--s.miniChunkCount]" not in trim or "s.miniBitmapCapacity =" not in trim:
+    failures.append("trimMiniChunks does not free surplus chunks or update capacity")
 if "uint8_t** miniChunks = nullptr;" not in header:
     failures.append("PerStyle has no page chunk list")
 
