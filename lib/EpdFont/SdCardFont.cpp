@@ -113,6 +113,11 @@ void SdCardFont::freeMiniChunks(PerStyle& s) {
   s.miniChunkBytes = 0;
 }
 
+void SdCardFont::trimMiniChunks(PerStyle& s, const uint32_t keep) {
+  while (s.miniChunkCount > keep) delete[] s.miniChunks[--s.miniChunkCount];
+  s.miniBitmapCapacity = s.miniChunkCount * s.miniChunkBytes;
+}
+
 bool SdCardFont::ensureMiniChunks(PerStyle& s, const uint32_t chunkBytes, const uint32_t count) {
   if (count > UINT16_MAX) return false;
   if (s.miniChunkBytes != chunkBytes) freeMiniChunks(s);
@@ -169,13 +174,19 @@ void SdCardFont::resetStyleMiniData(PerStyle& s) {
   // below that, so alternating dense/sparse pages never thrash. Evaluated at
   // most once per rebuild (a scope both constructs and destructs through here,
   // and subset hits load nothing new to judge).
-  if (s.miniHysteresisPending && !s.miniBitmapUsesCoverageArena && s.miniBitmapCapacity > 0 && s.miniBitmapUsed > 0) {
+  //
+  // Page bitmaps are allocated in whole chunks, so usage is judged in chunks: a
+  // page that fills part of its last chunk is not underusing it. On release,
+  // the page's bitmaps sit in its first neededChunks chunks, so only the
+  // surplus goes and the page stays resident for subset hits.
+  if (s.miniHysteresisPending && !s.miniBitmapUsesCoverageArena && s.miniChunkCount > 0 && s.miniBitmapUsed > 0) {
     s.miniHysteresisPending = false;
-    if (s.miniBitmapUsed < s.miniBitmapCapacity - s.miniBitmapCapacity / 4) {
+    const uint32_t neededChunks = ChunkedBitmapLayout::chunkCount(s.miniBitmapUsed, s.miniChunkBytes);
+    if (neededChunks < s.miniChunkCount - s.miniChunkCount / 4u) {
       if (++s.miniUnderuseRuns >= MINI_UNDERUSE_RUNS_BEFORE_FREE) {
-        LOG_DBG("SDCF", "mini release (underuse): used=%u cap=%u", s.miniBitmapUsed, s.miniBitmapCapacity);
-        freeStyleMiniData(s);
-        return;
+        LOG_DBG("SDCF", "mini trim (underuse): chunks %u -> %u", s.miniChunkCount, neededChunks);
+        trimMiniChunks(s, neededChunks);
+        s.miniUnderuseRuns = 0;
       }
     } else {
       s.miniUnderuseRuns = 0;
@@ -1924,20 +1935,23 @@ const EpdGlyph* SdCardFont::onGlyphMiss(void* ctx, uint32_t codepoint) {
   return &self->overflow_[slot].glyph;
 }
 
-bool SdCardFont::isOverflowGlyph(const EpdGlyph* glyph) const {
-  for (uint32_t i = 0; i < overflowCapacity_; i++) {
-    if (&overflow_[i].glyph == glyph) return true;
-  }
-  return false;
+// Overflow glyphs are handed out as &overflow_[slot].glyph, so the slot follows
+// from the address. The renderer asks for every SD glyph it draws; this keeps
+// that O(1) instead of scanning the whole slot table per glyph.
+int32_t SdCardFont::overflowSlotOf(const EpdGlyph* glyph) const {
+  const auto addr = reinterpret_cast<uintptr_t>(glyph);
+  const auto base = reinterpret_cast<uintptr_t>(overflow_);
+  if (!overflow_ || addr < base) return -1;
+  const uintptr_t slot = (addr - base) / sizeof(OverflowEntry);
+  if (slot >= overflowCapacity_ || &overflow_[slot].glyph != glyph) return -1;
+  return static_cast<int32_t>(slot);
 }
 
+bool SdCardFont::isOverflowGlyph(const EpdGlyph* glyph) const { return overflowSlotOf(glyph) >= 0; }
+
 const uint8_t* SdCardFont::getOverflowBitmap(const EpdGlyph* glyph) const {
-  for (uint32_t i = 0; i < overflowCapacity_; i++) {
-    if (&overflow_[i].glyph == glyph) {
-      return overflow_[i].bitmap;
-    }
-  }
-  return nullptr;
+  const int32_t slot = overflowSlotOf(glyph);
+  return slot >= 0 ? overflow_[slot].bitmap : nullptr;
 }
 
 SdCardFont* SdCardFont::fromMissCtx(void* ctx) { return static_cast<OverflowContext*>(ctx)->self; }
@@ -1945,7 +1959,8 @@ SdCardFont* SdCardFont::fromMissCtx(void* ctx) { return static_cast<OverflowCont
 const uint8_t* SdCardFont::glyphBitmap(const void* ctx, const EpdGlyph* glyph) {
   const auto* oc = static_cast<const OverflowContext*>(ctx);
   const SdCardFont* self = oc->self;
-  if (self->isOverflowGlyph(glyph)) return self->getOverflowBitmap(glyph);
+  const int32_t slot = self->overflowSlotOf(glyph);
+  if (slot >= 0) return self->overflow_[slot].bitmap;
 
   // Otherwise the glyph belongs to this style's prewarmed page data. A
   // metadata-only build never loaded bitmaps, so its offsets are still file

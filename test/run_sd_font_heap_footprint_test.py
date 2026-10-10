@@ -42,7 +42,7 @@ if "OVERFLOW_TABLE_CAPACITIES" not in ensure:
 # expose indeterminate glyph metrics.
 if "new (std::nothrow) OverflowEntry[capacity]()" not in ensure:
     failures.append("slot table entries are not value-initialized")
-miss = body("const EpdGlyph* SdCardFont::onGlyphMiss", "bool SdCardFont::isOverflowGlyph")
+miss = body("const EpdGlyph* SdCardFont::onGlyphMiss", "int32_t SdCardFont::overflowSlotOf")
 ensure_at = miss.find("ensureOverflowTable()")
 if ensure_at < 0 or ensure_at > miss.find("uint32_t slot = self->overflowNext_;"):
     failures.append("onGlyphMiss picks a slot before the table exists")
