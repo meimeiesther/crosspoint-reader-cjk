@@ -76,6 +76,10 @@ const char* asCStr(const char* s) { return s; }
 // resetStyleMiniData retention bounds (see the PerStyle comment in the header).
 constexpr size_t MINI_RETAIN_MIN_FREE_HEAP = 40 * 1024;
 constexpr uint8_t MINI_UNDERUSE_RUNS_BEFORE_FREE = 3;
+// A partial page keeps at least this much heap free: the overflow reserve
+// (OVERFLOW_LOW_HEAP_RESERVE_BYTES) plus as much again of bitmap budget for the
+// glyphs it leaves to on-demand loading.
+constexpr size_t PARTIAL_PREWARM_MIN_FREE_HEAP = 16 * 1024;
 // Above this size, the compact interval table becomes both expensive and
 // vulnerable to heap fragmentation. A page-packed BMP coverage bitmap
 // provides the same glyph-index mapping with one smaller allocation. Keep the
@@ -1191,20 +1195,25 @@ int SdCardFont::prewarmStyle(uint8_t styleIdx, const uint32_t* codepoints, uint3
     return PREWARM_FAILED;
   }
 
-  s.miniIntervalCount = 0;
-  uint32_t rangeStart = 0;
-  for (uint32_t i = 1; i <= validCount; i++) {
-    if ((i & 0x0Fu) == 0 && cancelled()) {
-      delete[] mappings;
-      return cancel();
+  // Mini glyph i belongs to mappings[i] (codepoint order); a partial page
+  // rebuilds the intervals for the glyphs it keeps.
+  const auto buildMiniIntervals = [&s, mappings](const uint32_t glyphCount) {
+    s.miniIntervalCount = 0;
+    uint32_t rangeStart = 0;
+    for (uint32_t i = 1; i <= glyphCount; i++) {
+      if (i == glyphCount || mappings[i].codepoint != mappings[i - 1].codepoint + 1) {
+        s.miniIntervals[s.miniIntervalCount].first = mappings[rangeStart].codepoint;
+        s.miniIntervals[s.miniIntervalCount].last = mappings[i - 1].codepoint;
+        s.miniIntervals[s.miniIntervalCount].offset = rangeStart;
+        s.miniIntervalCount++;
+        rangeStart = i;
+      }
     }
-    if (i == validCount || mappings[i].codepoint != mappings[i - 1].codepoint + 1) {
-      s.miniIntervals[s.miniIntervalCount].first = mappings[rangeStart].codepoint;
-      s.miniIntervals[s.miniIntervalCount].last = mappings[i - 1].codepoint;
-      s.miniIntervals[s.miniIntervalCount].offset = rangeStart;
-      s.miniIntervalCount++;
-      rangeStart = i;
-    }
+  };
+  buildMiniIntervals(validCount);
+  if (cancelled()) {
+    delete[] mappings;
+    return cancel();
   }
 
   // Mini glyph array (reused across pages when it fits)
@@ -1321,12 +1330,52 @@ int SdCardFont::prewarmStyle(uint8_t styleIdx, const uint32_t* codepoints, uint3
     if (!arena) {
       const uint32_t chunkCount = ChunkedBitmapLayout::chunkCount(packedBytes, chunkBytes);
       if (!ensureMiniChunks(s, chunkBytes, chunkCount)) {
-        LOG_ERR("SDCF", "Failed to allocate mini bitmap (%u x %u-byte chunks) for style %u", chunkCount, chunkBytes,
-                styleIdx);
-        delete[] readOrder;
-        delete[] mappings;
-        freeStyleMiniData(s);
-        return PREWARM_FAILED;
+        // Partial page: keep the chunks that were allocated, minus a reserve
+        // for the on-demand path and concurrent work (section indexing), and
+        // load the glyphs that fit. The rest leave the mini data and load
+        // through onGlyphMiss like any uncached glyph, so the page draws with
+        // fewer SD reads than dropping the whole prewarm would cost.
+        while (s.miniChunkCount > 0 && ESP.getFreeHeap() < PARTIAL_PREWARM_MIN_FREE_HEAP) {
+          trimMiniChunks(s, s.miniChunkCount - 1u);
+        }
+        if (s.miniChunkCount == 0) {
+          LOG_ERR("SDCF", "Failed to allocate mini bitmap (%u x %u-byte chunks) for style %u", chunkCount, chunkBytes,
+                  styleIdx);
+          delete[] readOrder;
+          delete[] mappings;
+          freeStyleMiniData(s);
+          return PREWARM_FAILED;
+        }
+        // Plan in file order like the read loop, so both passes place the kept
+        // glyphs identically. A glyph that would end past the allocated chunks
+        // is dropped; a later, smaller one may still fit.
+        const uint32_t requested = validCount;
+        const uint32_t capacity = s.miniChunkCount * chunkBytes;
+        packedBytes = 0;
+        for (uint32_t i = 0; i < validCount; i++) {
+          const uint32_t mapIdx = readOrder[i];
+          const uint32_t length = s.miniGlyphs[mapIdx].dataLength;
+          if (length == 0) continue;
+          if (!ChunkedBitmapLayout::tryPlace(packedBytes, length, chunkBytes, capacity)) {
+            mappings[mapIdx].globalIndex = -1;
+          }
+        }
+        // Compact the kept glyphs in codepoint order and re-derive the read order.
+        uint32_t kept = 0;
+        for (uint32_t i = 0; i < validCount; i++) {
+          if (mappings[i].globalIndex < 0) continue;
+          s.miniGlyphs[kept] = s.miniGlyphs[i];
+          mappings[kept] = mappings[i];
+          kept++;
+        }
+        validCount = kept;
+        s.miniGlyphCount = kept;
+        for (uint32_t i = 0; i < validCount; i++) readOrder[i] = i;
+        std::sort(readOrder, readOrder + validCount,
+                  [&](uint32_t a, uint32_t b) { return s.miniGlyphs[a].dataOffset < s.miniGlyphs[b].dataOffset; });
+        buildMiniIntervals(validCount);
+        LOG_INF("SDCF", "Prewarm: partial page for style %u (%u/%u glyphs in %u/%u chunks)", styleIdx, validCount,
+                requested, s.miniChunkCount, chunkCount);
       }
       s.miniBitmapCapacity = s.miniChunkCount * chunkBytes;
     }
