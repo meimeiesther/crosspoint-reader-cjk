@@ -94,6 +94,64 @@ void unboundedChunkNeverPads() {
   }
 }
 
+// A partial page plans with tryPlace() over every glyph, then the read loop
+// replays place() over the kept glyphs only. Both must yield the same offsets,
+// all inside the chunks that were actually allocated.
+void partialPlanMatchesReadPass() {
+  constexpr uint32_t kChunkBytes = 4096;
+  uint32_t state = 99;
+  for (uint32_t allocated = 1; allocated <= 8; allocated++) {
+    const uint32_t capacity = allocated * kChunkBytes;
+    std::vector<uint32_t> lengths;
+    for (int i = 0; i < 80; i++) lengths.push_back(nextRandom(state) % 1200);  // 0 = no bitmap
+    std::vector<uint32_t> planned;
+    std::vector<bool> kept;
+    uint32_t cursor = 0;
+    for (const uint32_t length : lengths) {
+      if (length == 0) {
+        kept.push_back(true);
+        continue;
+      }
+      const uint32_t before = cursor;
+      const bool fits = ChunkedBitmapLayout::tryPlace(cursor, length, kChunkBytes, capacity);
+      kept.push_back(fits);
+      if (!fits) {
+        expect(cursor == before, "failed tryPlace moved the cursor", cursor);
+        continue;
+      }
+      planned.push_back(cursor - length);
+      expect(cursor <= capacity, "kept glyph ends past the allocated chunks", cursor);
+    }
+    const uint32_t plannedEnd = cursor;
+    uint32_t replay = 0;
+    size_t next = 0;
+    for (size_t i = 0; i < lengths.size(); i++) {
+      if (!kept[i] || lengths[i] == 0) continue;
+      const uint32_t at = ChunkedBitmapLayout::place(replay, lengths[i], kChunkBytes);
+      expect(next < planned.size() && planned[next] == at, "read pass offset differs from plan", at);
+      expect(at / kChunkBytes < allocated, "read pass resolves past the allocated chunks", at);
+      next++;
+    }
+    expect(next == planned.size(), "read pass placed a different glyph count", static_cast<uint32_t>(next));
+    expect(replay == plannedEnd, "read pass ends elsewhere than the plan", replay);
+    expect(ChunkedBitmapLayout::chunkCount(plannedEnd, kChunkBytes) <= allocated, "plan needs more chunks", allocated);
+  }
+}
+
+// A glyph too big for the room left in the last chunk is dropped, but a later
+// smaller one that still fits is kept.
+void partialPlanKeepsSmallerGlyphsAfterADrop() {
+  uint32_t cursor = 0;
+  expect(ChunkedBitmapLayout::tryPlace(cursor, 3000, 4096, 4096), "first glyph rejected");
+  expect(!ChunkedBitmapLayout::tryPlace(cursor, 1200, 4096, 4096), "glyph past capacity accepted", cursor);
+  expect(cursor == 3000, "rejected glyph moved the cursor", cursor);
+  expect(ChunkedBitmapLayout::tryPlace(cursor, 1000, 4096, 4096), "smaller glyph that fits rejected", cursor);
+  expect(cursor == 4000, "smaller glyph misplaced", cursor);
+  expect(ChunkedBitmapLayout::tryPlace(cursor, 96, 4096, 4096), "glyph exactly filling the last chunk rejected",
+         cursor);
+  expect(cursor == 4096, "exact-fit glyph misplaced", cursor);
+}
+
 }  // namespace
 
 int main() {
@@ -101,6 +159,8 @@ int main() {
   exactFitDoesNotSkipAChunk();
   chunkSizedGlyphsGetOneChunkEach();
   unboundedChunkNeverPads();
+  partialPlanMatchesReadPass();
+  partialPlanKeepsSmallerGlyphsAfterADrop();
   if (failures != 0) {
     std::fprintf(stderr, "%d chunked bitmap layout check(s) failed\n", failures);
     return EXIT_FAILURE;

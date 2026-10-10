@@ -39,6 +39,24 @@ if "std::max(MINI_CHUNK_BYTES, maxGlyphBytes)" not in prewarm:
 if prewarm.count("ChunkedBitmapLayout::place(") < 2:
     failures.append("chunk count and read loop do not share the same packing")
 
+# Partial page: when not every chunk can be allocated, keep what was obtained
+# (above a heap reserve), load the glyphs that fit and drop the rest from the
+# mini data so they load on demand. Only zero chunks fails the prewarm.
+alloc_fail = body(prewarm, "if (!ensureMiniChunks(s, chunkBytes, chunkCount)) {", "s.miniBitmapCapacity = s.miniChunkCount * chunkBytes;")
+fail_at = alloc_fail.find("return PREWARM_FAILED;")
+if "if (s.miniChunkCount == 0) {" not in alloc_fail or fail_at < alloc_fail.find("if (s.miniChunkCount == 0) {"):
+    failures.append("chunk allocation failure drops the page instead of keeping a partial one")
+if "ESP.getFreeHeap() < PARTIAL_PREWARM_MIN_FREE_HEAP" not in alloc_fail or "trimMiniChunks(s, s.miniChunkCount - 1u)" not in alloc_fail:
+    failures.append("partial page keeps chunks below the heap reserve")
+if "ChunkedBitmapLayout::tryPlace(packedBytes, length, chunkBytes, capacity)" not in alloc_fail:
+    failures.append("partial page does not plan which glyphs fit the allocated chunks")
+if "mappings[mapIdx].globalIndex = -1;" not in alloc_fail or "s.miniGlyphCount = kept;" not in alloc_fail:
+    failures.append("partial page does not drop the glyphs that did not fit")
+if "buildMiniIntervals(validCount);" not in alloc_fail or "readOrder[i] = i;" not in alloc_fail:
+    failures.append("partial page keeps stale intervals or read order for dropped glyphs")
+if "s.miniBitmapCapacity = s.miniChunkCount * chunkBytes;" not in prewarm:
+    failures.append("partial page capacity does not follow the kept chunks")
+
 lookup = body(source, "const uint8_t* SdCardFont::glyphBitmap")
 for needle, message in (
     ("overflowSlotOf(glyph)", "glyphBitmap ignores overflow glyphs"),
